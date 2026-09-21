@@ -1,14 +1,14 @@
 #!/usr/bin/env bun
-// Which npm packages import symbols from a given dependency (default n8n-core)?
+// Scan npm packages and report which symbols they import from given dependencies.
 //
-//   bun npmsweep.ts scan [--dep n8n-core] [--query <npm search>]... [--filter <regex>] [--limit N]
-//                     [--all] [--concurrency N] [--reanalyze] [--refresh] [--symbol X]
-//   bun npmsweep.ts report [--dep n8n-core] [--filter <regex>] [--symbol X]     # cache only
+//   bun npmsweep.ts scan --dep <name>... --query <npm search>... [--filter <regex>] [--exclude <regex>]
+//                        [--limit N] [--all] [--concurrency N] [--reanalyze] [--refresh] [--symbol X]
+//   bun npmsweep.ts report --dep <name>... [--filter <regex>] [--exclude <regex>] [--symbol X]
 //   bun npmsweep.ts selftest
 //
-// --all downloads every package instead of only those that declare --dep in package.json.
-// Packages resolve host-installed deps at runtime without declaring them, so --all is the
-// only mode that finds real breakage. --reanalyze reparses cached tarballs; --refresh redownloads.
+// Without --all only packages that declare a --dep in package.json are downloaded. Packages
+// resolve host-installed deps at runtime without declaring them, so --all is the only mode that
+// finds real breakage. --reanalyze reparses cached tarballs; --refresh redownloads everything.
 
 import ts from 'typescript';
 import { gunzipSync } from 'node:zlib';
@@ -25,18 +25,19 @@ type Result<T, E = string> = Ok<T> | Err<E>;
 
 const ok = <T>(value: T): Ok<T> => ({ ok: true, value });
 const err = <E>(error: E): Err<E> => ({ ok: false, error });
+const message = (e: unknown) => (e instanceof Error ? e.message : String(e));
 const attempt = <T>(ctx: string, fn: () => T): Result<T> => {
 	try {
 		return ok(fn());
 	} catch (e) {
-		return err(`${ctx}: ${e instanceof Error ? e.message : String(e)}`);
+		return err(`${ctx}: ${message(e)}`);
 	}
 };
 const attemptAsync = async <T>(ctx: string, fn: () => Promise<T>): Promise<Result<T>> => {
 	try {
 		return ok(await fn());
 	} catch (e) {
-		return err(`${ctx}: ${e instanceof Error ? e.message : String(e)}`);
+		return err(`${ctx}: ${message(e)}`);
 	}
 };
 
@@ -45,9 +46,10 @@ const attemptAsync = async <T>(ctx: string, fn: () => Promise<T>): Promise<Resul
 type Command = 'scan' | 'report' | 'selftest';
 type Options = {
 	readonly command: Command;
-	readonly dep: string;
+	readonly deps: readonly string[];
 	readonly queries: readonly string[];
 	readonly filter: RegExp | undefined;
+	readonly exclude: RegExp | undefined;
 	readonly all: boolean;
 	readonly reanalyze: boolean;
 	readonly refresh: boolean;
@@ -58,21 +60,26 @@ type Options = {
 };
 
 const COMMANDS: readonly Command[] = ['scan', 'report', 'selftest'];
-const DEFAULT_QUERIES = ['keywords:n8n-community-node-package', 'n8n-nodes-'];
+const USAGE = `usage: bun npmsweep.ts <${COMMANDS.join('|')}> --dep <name>... [--query <npm search>...] [options]`;
 const isCommand = (s: string | undefined): s is Command => COMMANDS.includes(s as Command);
 
 const parseArgs = (argv: readonly string[]): Result<Options> => {
 	const [command, ...rest] = argv;
-	if (!isCommand(command)) return err(`usage: bun npmsweep.ts <${COMMANDS.join('|')}> [options]`);
+	if (!isCommand(command)) return err(USAGE);
 	const flag = (n: string) => rest.includes(n);
 	const opts = (n: string) => rest.flatMap((a, i) => (a === n && rest[i + 1] !== undefined ? [rest[i + 1] as string] : []));
 	const opt = (n: string) => opts(n).at(-1);
-	const filter = opt('--filter');
+	const deps = opts('--dep');
+	const queries = opts('--query');
+	if (command !== 'selftest' && !deps.length) return err(`--dep is required\n${USAGE}`);
+	if (command === 'scan' && !queries.length) return err(`--query is required for scan\n${USAGE}`);
+	const regex = (n: string) => (opt(n) ? new RegExp(opt(n) as string) : undefined);
 	return ok({
 		command,
-		dep: opt('--dep') ?? 'n8n-core',
-		queries: opts('--query').length ? opts('--query') : DEFAULT_QUERIES,
-		filter: filter ? new RegExp(filter) : undefined,
+		deps,
+		queries,
+		filter: regex('--filter'),
+		exclude: regex('--exclude'),
 		all: flag('--all'),
 		reanalyze: flag('--reanalyze'),
 		refresh: flag('--refresh'),
@@ -83,6 +90,9 @@ const parseArgs = (argv: readonly string[]): Result<Options> => {
 		cacheDir: join(fileURLToPath(new URL('.', import.meta.url)), '.cache'),
 	});
 };
+
+const selects = ({ filter, exclude }: Options, name: string) =>
+	(!filter || filter.test(name)) && !(exclude && exclude.test(name));
 
 // ---------------------------------------------------------------- http
 
@@ -116,6 +126,7 @@ const getBuffer = async (url: string): Promise<Result<Buffer>> => {
 type PackageRef = { readonly name: string; readonly version: string };
 type SearchPage = { readonly objects: ReadonlyArray<{ readonly package: PackageRef }> };
 type Manifest = Readonly<Record<string, Record<string, string> | undefined>>;
+type DepFields = Readonly<Record<string, Record<string, string>>>;
 
 const SEARCH_PAGE = 250;
 const SEARCH_CAP = 10_000;
@@ -126,26 +137,27 @@ const searchPage = (query: string, from: number) =>
 		`https://registry.npmjs.org/-/v1/search?text=${encodeURIComponent(query)}&size=${SEARCH_PAGE}&from=${from}`,
 	);
 
-const listPackages = async ({ queries, filter, limit }: Options): Promise<Result<readonly PackageRef[]>> => {
+const listPackages = async (opts: Options): Promise<Result<readonly PackageRef[]>> => {
 	const seen = new Map<string, PackageRef>();
-	const matches = (p: PackageRef) => !filter || filter.test(p.name);
-	for (const query of queries) {
-		for (let from = 0; from < SEARCH_CAP && seen.size < limit; from += SEARCH_PAGE) {
+	for (const query of opts.queries) {
+		for (let from = 0; from < SEARCH_CAP && seen.size < opts.limit; from += SEARCH_PAGE) {
 			const page = await searchPage(query, from);
 			if (!page.ok) return page;
 			if (!page.value.objects.length) break;
-			page.value.objects.filter((o) => matches(o.package)).forEach((o) => seen.set(o.package.name, o.package));
+			page.value.objects
+				.filter((o) => selects(opts, o.package.name))
+				.forEach((o) => seen.set(o.package.name, o.package));
 		}
 	}
-	return ok([...seen.values()].slice(0, limit));
+	return ok([...seen.values()].slice(0, opts.limit));
 };
 
 const tarballUrl = ({ name, version }: PackageRef) =>
 	`https://registry.npmjs.org/${name}/-/${name.split('/').pop()}-${version}.tgz`;
 
-type DepFields = Readonly<Record<string, Record<string, string>>>;
 const depFieldsOf = (manifest: Manifest): DepFields =>
 	Object.fromEntries(DEP_FIELDS.flatMap((k) => (manifest[k] ? [[k, manifest[k]]] : [])));
+
 const declaredIn = (fields: DepFields, dep: string): readonly string[] =>
 	Object.entries(fields).flatMap(([k, deps]) => (deps[dep] ? [`${k}:${deps[dep]}`] : []));
 
@@ -153,8 +165,7 @@ const declaredIn = (fields: DepFields, dep: string): readonly string[] =>
 
 type TarEntry = { readonly path: string; readonly body: Buffer };
 
-const cstr = (buf: Buffer, start: number, end: number) =>
-	buf.toString('utf8', start, end).replace(/\0.*$/s, '');
+const cstr = (buf: Buffer, start: number, end: number) => buf.toString('utf8', start, end).replace(/\0.*$/s, '');
 
 // Minimal ustar + pax reader; regular files only.
 function* tarEntries(tgz: Buffer): Generator<TarEntry> {
@@ -182,8 +193,9 @@ function* tarEntries(tgz: Buffer): Generator<TarEntry> {
 // ---------------------------------------------------------------- analyzer
 
 type SymbolCounts = Readonly<Record<string, number>>;
-type Analysis = { readonly runtime: SymbolCounts; readonly types: SymbolCounts };
+type Analysis = { readonly runtime: SymbolCounts; readonly types: SymbolCounts; readonly skippedFiles: readonly string[] };
 
+const EMPTY: Analysis = { runtime: {}, types: {}, skippedFiles: [] };
 const UNRESOLVED = '*';
 
 const tally = (names: readonly string[]): SymbolCounts =>
@@ -313,14 +325,20 @@ export const symbolsIn = (dep: string, fileName: string, text: string): SymbolCo
 const isRuntimeFile = (p: string) => /\.(c|m)?js$/.test(p);
 const isTypesFile = (p: string) => p.endsWith('.d.ts');
 
-const analyzeTarball = (dep: string, tgz: Buffer): Result<Analysis> =>
+const analyzeEntry = (dep: string, acc: Analysis, { path, body }: TarEntry): Analysis => {
+	const kind = isTypesFile(path) ? 'types' : isRuntimeFile(path) ? 'runtime' : undefined;
+	if (!kind) return acc;
+	// A single pathological file (deep nesting, huge bundle) must not void the whole package.
+	const counts = attempt(path, () => symbolsIn(dep, path, body.toString()));
+	return counts.ok
+		? { ...acc, [kind]: mergeCounts(acc[kind], counts.value) }
+		: { ...acc, skippedFiles: [...acc.skippedFiles, path] };
+};
+
+const analyzeTarball = (deps: readonly string[], tgz: Buffer): Result<Readonly<Record<string, Analysis>>> =>
 	attempt('analyze', () => {
-		const empty: Analysis = { runtime: {}, types: {} };
-		return [...tarEntries(tgz)].reduce<Analysis>((acc, { path, body }) => {
-			if (isTypesFile(path)) return { ...acc, types: mergeCounts(acc.types, symbolsIn(dep, path, body.toString())) };
-			if (isRuntimeFile(path)) return { ...acc, runtime: mergeCounts(acc.runtime, symbolsIn(dep, path, body.toString())) };
-			return acc;
-		}, empty);
+		const entries = [...tarEntries(tgz)];
+		return Object.fromEntries(deps.map((dep) => [dep, entries.reduce((acc, e) => analyzeEntry(dep, acc, e), EMPTY)]));
 	});
 
 // ---------------------------------------------------------------- cache
@@ -353,12 +371,14 @@ const makeCache = (dir: string, skip: ReadonlySet<string>): Cache => {
 
 // meta and tarballs are dep-independent; analysis results are not.
 const resultsKind = (dep: string) => `results/${dep.replace('/', '__')}`;
-const skippedCaches = (o: Options): ReadonlySet<string> =>
-	new Set(o.refresh ? ['meta', 'tarballs', resultsKind(o.dep)] : o.reanalyze ? [resultsKind(o.dep)] : []);
+const skippedCaches = (o: Options): ReadonlySet<string> => {
+	const results = o.deps.map(resultsKind);
+	return new Set(o.refresh ? ['meta', 'tarballs', ...results] : o.reanalyze ? results : []);
+};
 
 // ---------------------------------------------------------------- pipeline
 
-type PackageReport = PackageRef & { readonly declared: readonly string[]; readonly analysis: Analysis };
+type DepReport = PackageRef & { readonly dep: string; readonly declared: readonly string[]; readonly analysis: Analysis };
 
 const parseJson = <T>(b: Buffer): T => JSON.parse(b.toString()) as T;
 const identity = (b: Buffer) => b;
@@ -381,26 +401,30 @@ const tarballFor = async (ref: PackageRef, cache: Cache): Promise<Result<Buffer>
 	return tgz;
 };
 
-const processPackage = async (ref: PackageRef, opts: Options, cache: Cache): Promise<Result<PackageReport>> => {
-	const results = resultsKind(opts.dep);
-	const cached = await cache.read(results, ref, parseJson<PackageReport>);
-	if (cached) return ok(cached);
+const processPackage = async (ref: PackageRef, opts: Options, cache: Cache): Promise<Result<readonly DepReport[]>> => {
+	const cached = await Promise.all(opts.deps.map((dep) => cache.read(resultsKind(dep), ref, parseJson<DepReport>)));
+	const pending = opts.deps.filter((_, i) => !cached[i]);
+	const done = cached.flatMap((r) => (r ? [r] : []));
+	if (!pending.length) return ok(done);
 
 	const fields = await depFieldsFor(ref, cache);
 	if (!fields.ok) return fields;
-	const declared = declaredIn(fields.value, opts.dep);
-	const empty: Analysis = { runtime: {}, types: {} };
-	const finish = async (analysis: Analysis) => {
-		const report: PackageReport = { ...ref, declared, analysis };
-		await cache.write(results, ref, JSON.stringify(report));
-		return ok(report);
-	};
-	if (!opts.all && !declared.length) return finish(empty);
+	const declared = Object.fromEntries(pending.map((dep) => [dep, declaredIn(fields.value, dep)]));
+	const toAnalyze = opts.all ? pending : pending.filter((dep) => declared[dep]?.length);
 
-	const tgz = await tarballFor(ref, cache);
-	if (!tgz.ok) return tgz;
-	const analysis = analyzeTarball(opts.dep, tgz.value);
-	return analysis.ok ? finish(analysis.value) : analysis;
+	const analyses = toAnalyze.length
+		? await tarballFor(ref, cache).then((tgz) => (tgz.ok ? analyzeTarball(toAnalyze, tgz.value) : tgz))
+		: ok<Readonly<Record<string, Analysis>>>({});
+	if (!analyses.ok) return analyses;
+
+	const fresh = pending.map<DepReport>((dep) => ({
+		...ref,
+		dep,
+		declared: declared[dep] ?? [],
+		analysis: analyses.value[dep] ?? EMPTY,
+	}));
+	await Promise.all(fresh.map((r) => cache.write(resultsKind(r.dep), ref, JSON.stringify(r))));
+	return ok([...done, ...fresh]);
 };
 
 const pool = async <T, R>(items: readonly T[], limit: number, fn: (t: T) => Promise<R>, onDone: (n: number) => void) => {
@@ -420,29 +444,36 @@ const pool = async <T, R>(items: readonly T[], limit: number, fn: (t: T) => Prom
 
 // ---------------------------------------------------------------- report
 
-const groupBySymbol = (reports: readonly PackageReport[], key: keyof Analysis) =>
+const groupBySymbol = (reports: readonly DepReport[], key: 'runtime' | 'types') =>
 	reports.reduce<Record<string, string[]>>((acc, r) => {
 		const id = `${r.name}@${r.version}`;
 		return Object.keys(r.analysis[key]).reduce((a, s) => ({ ...a, [s]: [...(a[s] ?? []), id] }), acc);
 	}, {});
 
-const report = (all: readonly PackageReport[], errors: readonly string[], opts: Options) => {
-	const reports = opts.filter ? all.filter((r) => opts.filter?.test(r.name)) : all;
-	const has = (r: PackageReport, k: keyof Analysis) => Object.keys(r.analysis[k]).length > 0;
+const depSection = (reports: readonly DepReport[], symbol: string | undefined) => {
+	const has = (r: DepReport, k: 'runtime' | 'types') => Object.keys(r.analysis[k]).length > 0;
 	const bySymbol = groupBySymbol(reports, 'runtime');
 	const typesBySymbol = groupBySymbol(reports, 'types');
-	return opts.symbol
-		? { symbol: opts.symbol, runtime: bySymbol[opts.symbol] ?? [], types: typesBySymbol[opts.symbol] ?? [] }
+	return symbol
+		? { runtime: bySymbol[symbol] ?? [], types: typesBySymbol[symbol] ?? [] }
 		: {
-				dep: opts.dep,
-				scanned: reports.length,
 				declaring: reports.filter((r) => r.declared.length).length,
 				runtimeImporters: reports.filter((r) => has(r, 'runtime')).length,
 				typeOnlyImporters: reports.filter((r) => !has(r, 'runtime') && has(r, 'types')).length,
 				bySymbol,
 				typesBySymbol,
-				errors,
+				skippedFiles: reports.flatMap((r) => r.analysis.skippedFiles.map((f) => `${r.name}@${r.version}:${f}`)),
 			};
+};
+
+const report = (all: readonly DepReport[], errors: readonly string[], opts: Options) => {
+	const reports = all.filter((r) => selects(opts, r.name));
+	const deps = Object.fromEntries(
+		opts.deps.map((dep) => [dep, depSection(reports.filter((r) => r.dep === dep), opts.symbol)]),
+	);
+	return opts.symbol
+		? { symbol: opts.symbol, deps }
+		: { scanned: new Set(reports.map((r) => r.name)).size, deps, errors };
 };
 
 // ---------------------------------------------------------------- selftest
@@ -482,7 +513,7 @@ const scan = async (opts: Options, cache: Cache): Promise<number> => {
 		console.error(pkgs.error);
 		return 1;
 	}
-	console.error(`inspecting ${pkgs.value.length} packages for ${opts.dep} (${opts.all ? 'all' : 'declaring only'})`);
+	console.error(`inspecting ${pkgs.value.length} packages for ${opts.deps.join(', ')} (${opts.all ? 'all' : 'declaring only'})`);
 	const t0 = Date.now();
 	const results = await pool(
 		pkgs.value,
@@ -491,16 +522,16 @@ const scan = async (opts: Options, cache: Cache): Promise<number> => {
 		(n) => n % 250 === 0 && console.error(`${n}/${pkgs.value.length}`),
 	);
 	console.error(`done in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-	const reports = results.flatMap((r) => (r.ok ? [r.value] : []));
+	const reports = results.flatMap((r) => (r.ok ? r.value : []));
 	const errors = results.flatMap((r) => (r.ok ? [] : [r.error]));
 	console.log(JSON.stringify(report(reports, errors, opts), null, 2));
 	return 0;
 };
 
 const reportOnly = async (opts: Options, cache: Cache): Promise<number> => {
-	const reports = await cache.list(resultsKind(opts.dep), parseJson<PackageReport>);
+	const reports = (await Promise.all(opts.deps.map((dep) => cache.list(resultsKind(dep), parseJson<DepReport>)))).flat();
 	if (!reports.length) {
-		console.error(`no cached results for ${opts.dep}; run scan first`);
+		console.error(`no cached results for ${opts.deps.join(', ')}; run scan first`);
 		return 1;
 	}
 	console.log(JSON.stringify(report(reports, [], opts), null, 2));
