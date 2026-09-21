@@ -1,0 +1,11 @@
+{
+  "name": "npmsweep",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "typescript": "5"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2"
+  }
+}
